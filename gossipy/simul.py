@@ -3,7 +3,7 @@ from abc import ABC, abstractmethod
 from copy import deepcopy
 import numpy as np
 from numpy.random import shuffle, random, choice
-from typing import Callable, DefaultDict, Optional, Dict, List, Tuple
+from typing import Callable, DefaultDict, Optional, Dict, List, Tuple, TYPE_CHECKING
 from rich.progress import track
 import dill
 import json
@@ -363,17 +363,23 @@ class GossipSimulator(SimulationEventSender):
     #         self.n_nodes += 1
 
 
-    def start(self, n_rounds: int=100) -> None:
+    def start(self,
+              n_rounds: int=100,
+              stop_condition: Optional[Callable[[int, 'GossipSimulator'], bool]]=None) -> None:
         """Starts the simulation.
 
         The simulation handles the messages exchange between the nodes for ``n_rounds`` rounds.
-        If attached to a :class:`SimulationReport`, the report is updated at each time step, 
+        If attached to a :class:`SimulationReport`, the report is updated at each time step,
         sent/fail message and evaluation.
 
         Parameters
         ----------
         n_rounds : int, default=100
             The number of rounds of the simulation.
+        stop_condition : callable or None, default=None
+            An optional stopping criterion function. It receives the current round number and
+            the simulator instance, and returns ``True`` if the simulation should stop early.
+            For example, this can be used to stop when a target metric is reached.
         """
 
         assert self.initialized, \
@@ -427,6 +433,7 @@ class GossipSimulator(SimulationEventSender):
                 del rep_queues[t]
 
                 if (t+1) % self.delta == 0:
+                    current_round = (t+1) // self.delta
                     if self.sampling_eval > 0:
                         sample = choice(list(self.nodes.keys()),
                                         max(int(self.n_nodes * self.sampling_eval), 1))
@@ -435,7 +442,7 @@ class GossipSimulator(SimulationEventSender):
                         ev = [n.evaluate() for _, n in self.nodes.items() if n.has_test()]
                     if ev:
                         self.notify_evaluation(t, True, ev)
-                    
+
                     if self.data_dispatcher.has_test():
                         if self.sampling_eval > 0:
                             ev = [self.nodes[i].evaluate(self.data_dispatcher.get_eval_set())
@@ -445,11 +452,16 @@ class GossipSimulator(SimulationEventSender):
                                 for _, n in self.nodes.items()]
                         if ev:
                             self.notify_evaluation(t, False, ev)
+
+                    if stop_condition is not None and stop_condition(current_round, self):
+                        LOG.info("Stopping criterion met at round %d." %current_round)
+                        break
+
                 self.notify_timestep(t)
 
         except KeyboardInterrupt:
             LOG.warning("Simulation interrupted by user.")
-        
+
         pbar.close()
         self.notify_end()
         return
@@ -580,7 +592,9 @@ class TokenizedGossipSimulator(GossipSimulator):
         self.accounts = {i: deepcopy(self.token_account_proto) for i in range(self.n_nodes)}
         
     # docstr-coverage:inherited
-    def start(self, n_rounds: int=100) -> Tuple[List[float], List[float]]:
+    def start(self,
+              n_rounds: int=100,
+              stop_condition: Optional[Callable[[int, 'GossipSimulator'], bool]]=None) -> None:
         node_ids = np.arange(self.n_nodes)
         pbar = track(range(n_rounds * self.delta), description="Simulating...")
         msg_queues = DefaultDict(list)
@@ -653,6 +667,7 @@ class TokenizedGossipSimulator(GossipSimulator):
                 del rep_queues[t]
 
                 if (t+1) % self.delta == 0:
+                    current_round = (t+1) // self.delta
                     if self.sampling_eval > 0:
                         sample = choice(list(self.nodes.keys()),
                                         max(int(self.n_nodes * self.sampling_eval), 1))
@@ -661,7 +676,7 @@ class TokenizedGossipSimulator(GossipSimulator):
                         ev = [n.evaluate() for _, n in self.nodes.items() if n.has_test()]
                     if ev:
                         self.notify_evaluation(t, True, ev)
-                    
+
                     if self.data_dispatcher.has_test():
                         if self.sampling_eval > 0:
                             ev = [self.nodes[i].evaluate(self.data_dispatcher.get_eval_set())
@@ -671,7 +686,11 @@ class TokenizedGossipSimulator(GossipSimulator):
                                 for _, n in self.nodes.items()]
                         if ev:
                             self.notify_evaluation(t, False, ev)
-                
+
+                    if stop_condition is not None and stop_condition(current_round, self):
+                        LOG.info("Stopping criterion met at round %d." %current_round)
+                        break
+
                 self.notify_timestep(t)
 
         except KeyboardInterrupt:
