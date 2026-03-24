@@ -4,13 +4,13 @@ import numpy as np
 from numpy.random import randint, normal, rand
 from numpy import ndarray
 from torch import Tensor
-from typing import Any, Optional, Union, Dict, Tuple
-from gossipy.data import DataDispatcher
+from typing import Any, Optional, Union, Dict, Tuple, Iterable
+from .data import DataDispatcher
 
 from . import CACHE, LOG
 from .core import AntiEntropyProtocol, CreateModelMode, MessageType, Message, P2PNetwork
 from .utils import choice_not_n
-from .model.handler import ModelHandler, PartitionedTMH, SamplingTMH
+from .model.handler import ModelHandler, PartitionedTMH, SamplingTMH, WeightedTMH
 from .model.sampling import TorchModelSampling
 
 # AUTHORSHIP
@@ -103,6 +103,9 @@ class GossipNode():
         """
 
         peers = self.p2p_net.get_peers(self.idx)
+        if not peers:
+            LOG.warning("Node %d has no peers.", self.idx)
+            return None
         return random.choice(peers) if peers else choice_not_n(0, self.p2p_net.size(), self.idx)
         
     def timed_out(self, t: int) -> bool:
@@ -295,14 +298,14 @@ class PassThroughNode(GossipNode):
         r"""Node implementing the pass-through gossiping protocol.
         
         This type of (gossiping) node has been introdued in cite:p:`Giaretta et al. 2019`.
-        This pass-through approach consist in making some nodes (in particular hub nodes
+        This pass-through approach consists in making some nodes (in particular hub nodes)
         "bridges" between (low-degree) nodes. This should allow the low-degree nodes to indirectly 
         gossip each other and thus hiding the possible power-law structure of the network. 
         In practice, when node :math:`j` receives a message from :math:`i`, it only performs the 
         merge and update steps with probability :math:`p(i, j) = \min(1, d_i/d_j)` where :math:`d_i`
         and :math:`d_j` are the degrees of :math:`i` and :math:`j`, respectively. Thus, if the 
         sender has lower degree than the receiver, there is a chance the receiver might save 
-        the received model as its current model and later propagate it, without going through the
+        the received model as its current model and later propagates it, without going through the
         usual update and merge operations. 
 
         Parameters
@@ -478,7 +481,7 @@ class CacheNeighNode(GossipNode):
         if msg_type == MessageType.PUSH or \
            msg_type == MessageType.REPLY or \
            msg_type == MessageType.PUSH_PULL:
-            if self.local_cache[sender]:
+            if sender in self.local_cache:
                 CACHE.pop(self.local_cache[sender])
             self.local_cache[sender] = recv_model
 
@@ -749,6 +752,8 @@ class PENSNode(GossipNode):
     def get_peer(self) -> int:
         if self.step == 1 or not self.best_nodes:
             peer = super().get_peer()
+            if peer is None:
+                return None
             if self.step == 1:
                 self.selected[peer] += 1
             return peer
@@ -789,3 +794,88 @@ class PENSNode(GossipNode):
         else:
             recv_model = CACHE.pop(recv_model)
             self.model_handler(recv_model, self.data[0])
+
+
+# Koloskova et al. 2020
+class All2AllGossipNode(GossipNode):
+    def __init__(self,
+                 idx: int, #node's id
+                 data: Union[Tuple[Tensor, Optional[Tensor]],
+                             Tuple[ndarray, Optional[ndarray]]], #node's data
+                 round_len: int, #round length
+                 model_handler: WeightedTMH, #object that handles the model learning/inference
+                 p2p_net: P2PNetwork,
+                 sync: bool=True):
+        r"""
+        TODO
+
+        Parameters
+        ----------
+        idx : int
+            The node's index.
+        data : tuple[Tensor, Optional[Tensor]] or tuple[ndarray, Optional[ndarray]]
+            The node's data in the format :math:`(X_\text{train}, y_\text{train}), (X_\text{test}, y_\text{test})`
+            where :math:`y_\text{train}` and :math:`y_\text{test}` can be `None` in the case of unsupervised learning.
+            Similarly, :math:`X_\text{test}` and :math:`y_\text{test}` can be `None` in the case the node does not have
+            a test set. 
+        round_len : int
+            The number of time units in a round.
+        model_handler : ModelHandler
+            The object that handles the model learning/inference.
+        p2p_net: P2PNetwork
+            The peer-to-peer network that provides the list of reachable nodes according to the 
+            network topology.
+        sync : bool, default=True
+            Whether the node is synchronous with the round's length. In this case, the node will 
+            regularly time out at the same point in the round. If `False`, the node will time out 
+            with a fixed delay. 
+        use_mh : bool, default=False
+            Whether to use the Metropolis-Hastings weighting scheme for the model averaging.
+        """
+        super(All2AllGossipNode, self).__init__(idx,
+                                        data,
+                                        round_len,
+                                        model_handler,
+                                        p2p_net,
+                                        sync)
+        self.local_cache = {}
+    
+    # docstr-coverage:inherited
+    def timed_out(self, t: int, weights: Iterable[float]) -> int:
+        tout = super().timed_out(t)
+        if tout and self.local_cache:
+            # if not self.use_mh:
+            #     weights = [1.0 /(1 + len(self.local_cache))] * (len(self.local_cache) + 1)
+            # else:
+            #     n = self.p2p_net.size(self.idx)
+            #     weights = [1./n] + [1. / (min(self.p2p_net.size(k), n) + 1) for k in self.local_cache]
+            self.model_handler([CACHE.pop(k) for k in self.local_cache.values()], self.data[0], weights)
+            self.local_cache = {}
+        return tout 
+
+    def get_peers(self) -> int:
+        return self.p2p_net.get_peers(self.idx)
+
+    # docstr-coverage:inherited
+    def send(self,
+             t: int,
+             peer: int,
+             protocol: AntiEntropyProtocol) -> Union[Message, None]:
+
+        if protocol == AntiEntropyProtocol.PUSH:
+            return super().send(t, peer, protocol)
+        else:
+            raise ValueError("All2AllNode only supports PUSH protocol.")
+
+    # docstr-coverage:inherited
+    def receive(self, t: int, msg: Message) -> Union[Message, None]:
+        msg_type: MessageType
+        recv_model: Any 
+        sender, msg_type, recv_model = msg.sender, msg.type, msg.value[0] if msg.value else None
+        if msg_type == MessageType.PUSH:
+            # this should never happen
+            if sender in self.local_cache:
+                CACHE.pop(self.local_cache[sender])
+            self.local_cache[sender] = recv_model
+
+        return None

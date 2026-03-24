@@ -10,7 +10,7 @@ from sklearn.metrics import accuracy_score, roc_auc_score, recall_score, f1_scor
 from sklearn.metrics.cluster import normalized_mutual_info_score as nmi
 from scipy.optimize import linear_sum_assignment as hungarian
 
-from .. import CACHE, LOG, CacheKey, Sizeable
+from .. import CACHE, LOG, CacheKey, GlobalSettings, Sizeable
 from ..core import CreateModelMode
 from . import TorchModel
 from .sampling import TorchModelPartition, TorchModelSampling
@@ -235,11 +235,14 @@ class TorchModelHandler(ModelHandler):
         assert (batch_size == 0 and local_epochs > 0) or (batch_size > 0)
         self.local_epochs = local_epochs
         self.batch_size = batch_size
+        self.device = GlobalSettings().get_device()
+        #self.model = self.model.to(self.device)
 
     def init(self) -> None:
         self.model.init_weights()
 
     def _update(self, data: Tuple[torch.Tensor, torch.Tensor]) -> None:
+        self.model = self.model.to(self.device)
         x, y = data
         x, y = x.to(self.device), y.to(self.device)
         batch_size = x.size(0) if not self.batch_size else self.batch_size
@@ -252,15 +255,17 @@ class TorchModelHandler(ModelHandler):
         else:
             perm = torch.randperm(x.size(0))
             self._local_step(x[perm][:batch_size], y[perm][:batch_size])
-        self.n_updates += 1
-
+        self.model.to("cpu")
+    
     def _local_step(self, x:torch.Tensor, y:torch.Tensor) -> None:
         self.model.train()
+        x, y = x.to(self.device), y.to(self.device)
         y_pred = self.model(x)
         loss = self.criterion(y_pred, y)
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
+        self.n_updates += 1
 
     def _merge(self, other_model_handler: Union[TorchModelHandler, Iterable[TorchModelHandler]]) -> None:
         dict_params1 = self.model.state_dict()
@@ -309,6 +314,7 @@ class TorchModelHandler(ModelHandler):
         x, y = data
         x, y = x.to(self.device), y.to(self.device)
         self.model.eval()
+        self.model.to(self.device)
         with torch.no_grad():
             scores = self.model(x)
 
@@ -334,6 +340,8 @@ class TorchModelHandler(ModelHandler):
             else:
                 res["auc"] = 0.5
                 LOG.warning("# of classes != 2. AUC is set to 0.5.")
+        
+        self.model = self.model.to("cpu")
         return res
 
 
@@ -505,6 +513,7 @@ class PartitionedTMH(TorchModelHandler):
     
     def _local_step(self, x:torch.Tensor, y:torch.Tensor) -> None:
         self.model.train()
+        x, y = x.to(self.device), y.to(self.device)
         self.n_updates += 1
         y_pred = self.model(x)
         loss = self.criterion(y_pred, y)
@@ -558,8 +567,8 @@ class MFModelHandler(ModelHandler):
             X = (1. - self.reg * self.lr) * X + self.lr * err * Y[i]
             b += self.lr * err
             c[i] += self.lr * err
+            self.n_updates += 1
         self.model = ((X, b), (Y, c))
-        self.n_updates += 1
 
     def _merge(self, other_model_handler: MFModelHandler) -> None:
         _, (Y1, c1) = other_model_handler.model
@@ -639,3 +648,104 @@ class KMeansHandler(ModelHandler):
     
     def get_size(self) -> int:
         return self.k * self.dim
+
+
+class WeightedTMH(TorchModelHandler):
+
+    def __call__(self,
+                 recv_model: Any,
+                 data: Any,
+                 weights: Iterable[float]) -> None:
+        if self.mode == CreateModelMode.UPDATE:
+            recv_model._update(data)
+            self.model = copy.deepcopy(recv_model.model)
+            self.n_updates = recv_model.n_updates
+        elif self.mode == CreateModelMode.MERGE_UPDATE:
+            self._merge(recv_model, weights)
+            self._update(data)
+        elif self.mode == CreateModelMode.UPDATE_MERGE:
+            self._update(data)
+            if isinstance(recv_model, Iterable):
+                for rm in recv_model:
+                    rm._update(data)
+            else:
+                recv_model._update(data)
+            self._merge(recv_model, weights)
+        else:
+            raise ValueError("Invalid create model mode %s for WeightedTMH." %str(self.mode))
+            
+    def _merge(self, 
+               other_model_handler: Union[TorchModelHandler, Iterable[TorchModelHandler]],
+               weights: Iterable[float]) -> None:
+        
+        dict_params1 = self.model.state_dict()
+
+        if isinstance(other_model_handler, TorchModelHandler):
+            dicts_params2 = [other_model_handler.model.state_dict()]
+            n_up = other_model_handler.n_updates
+        else:
+            dicts_params2 = [omh.model.state_dict() for omh in other_model_handler]
+            n_up = max([omh.n_updates for omh in other_model_handler])
+
+        # Perform the average overall models including its weights
+        # CHECK: whether to allow the merging of the other models before the averaging 
+        for key in dict_params1:
+            dict_params1[key] *= weights[0]
+            for i, dict_params2 in enumerate(dicts_params2):
+                dict_params1[key] += dict_params2[key] * weights[i + 1]
+
+        self.model.load_state_dict(dict_params1)
+        # Gets the maximum number of updates from the merged models
+        self.n_updates = max(self.n_updates, n_up)
+
+class LimitedMergeMixin():
+
+    def __init__(self, age_diff_threshold: int=1):
+        self.L = age_diff_threshold
+
+    def _merge(self, other_model_handler: Union[TorchModelHandler, Iterable[TorchModelHandler]]) -> None:
+        dict_params1 = self.model.state_dict()
+        
+        if isinstance(other_model_handler, TorchModelHandler):
+            dict_params2 = other_model_handler.model.state_dict()
+            n_up = other_model_handler.n_updates
+        else:
+            raise ValueError("Invalid type for other_model_handler: %s" %type(other_model_handler))
+
+        if self.n_updates > n_up + self.L:
+            self.model.load_state_dict(dict_params1)
+        elif n_up > self.n_updates + self.L:
+            self.model.load_state_dict(dict_params2)
+        else:
+            div = self.n_updates + n_up
+            for key in dict_params1:
+                dict_params1[key] = (self.n_updates / div) * dict_params1[key] + (n_up / div) * dict_params2[key]
+
+            self.model.load_state_dict(dict_params1)
+        
+        self.n_updates = max(self.n_updates, n_up) 
+
+
+# Danner et al. Improving Gossip Learning via Limited Model Merging (ICCCI 2023)
+class LimitedMergeTMH(LimitedMergeMixin, TorchModelHandler):
+    def __init__(self,
+                 net: TorchModel,
+                 optimizer: torch.optim.Optimizer,
+                 optimizer_params: Dict[str, Any],
+                 criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+                 local_epochs: int=1,
+                 batch_size: int=32,
+                 create_model_mode: CreateModelMode=CreateModelMode.MERGE_UPDATE,
+                 age_diff_threshold: int=1,
+                 copy_model=True):
+        LimitedMergeMixin.__init__(self, age_diff_threshold)
+        TorchModelHandler.__init__(self, 
+                                   net, 
+                                   optimizer, 
+                                   optimizer_params, 
+                                   criterion, 
+                                   local_epochs, 
+                                   batch_size, 
+                                   create_model_mode, 
+                                   copy_model)
+    
