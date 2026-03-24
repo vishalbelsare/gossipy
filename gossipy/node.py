@@ -671,9 +671,14 @@ class PENSNode(GossipNode):
                  n_sampled: int=10, #value from the paper
                  m_top: int=2, #value from the paper
                  step1_rounds=200,
+                 performance_metric: str="accuracy",
                  sync: bool=True):
-        """
-        TODO :cite:p:`Onoszko:2021`
+        r"""Node implementing the PENS (Peer-to-peer ENhanced Selection) gossip protocol.
+
+        This two-phase gossip learning node has been introduced in :cite:p:`Onoszko:2021`.
+        In the first phase (exploration), the node samples peers and evaluates their models
+        to identify the most beneficial neighbors. In the second phase (exploitation), the
+        node only communicates with the top-performing peers identified during the first phase.
 
         Parameters
         ----------
@@ -683,24 +688,30 @@ class PENSNode(GossipNode):
             The node's data in the format :math:`(X_\text{train}, y_\text{train}), (X_\text{test}, y_\text{test})`
             where :math:`y_\text{train}` and :math:`y_\text{test}` can be `None` in the case of unsupervised learning.
             Similarly, :math:`X_\text{test}` and :math:`y_\text{test}` can be `None` in the case the node does not have
-            a test set. 
+            a test set.
         round_len : int
             The number of time units in a round.
         model_handler : ModelHandler
             The object that handles the model learning/inference.
         p2p_net: P2PNetwork
-            The peer-to-peer network that provides the list of reachable nodes according to the 
+            The peer-to-peer network that provides the list of reachable nodes according to the
             network topology.
         n_sampled : int, default=10
-            TODO
+            The number of peers to sample in each exploration batch during the first phase.
+            Once ``n_sampled`` models have been collected, the top ``m_top`` are selected for merging.
         m_top : int, default=2
-            TODO
+            The number of top-performing peers to select from each batch of ``n_sampled`` peers.
+            These peers' models are merged with the local model.
         step1_rounds : int, default=200
-            TODO
+            The number of rounds for the first (exploration) phase. After this many rounds, the node
+            transitions to the second (exploitation) phase and only communicates with the best peers.
+        performance_metric : str, default="accuracy"
+            The name of the evaluation metric used to rank peer models during the exploration phase.
+            Must match a key returned by the model handler's ``evaluate`` method.
         sync : bool, default=True
-            Whether the node is synchronous with the round's length. In this case, the node will 
-            regularly time out at the same point in the round. If `False`, the node will time out 
-            with a fixed delay. 
+            Whether the node is synchronous with the round's length. In this case, the node will
+            regularly time out at the same point in the round. If `False`, the node will time out
+            with a fixed delay.
         """
 
         super(PENSNode, self).__init__(idx,
@@ -714,6 +725,7 @@ class PENSNode(GossipNode):
         self.cache = {}
         self.n_sampled = n_sampled
         self.m_top = m_top
+        self.performance_metric = performance_metric
         known_nodes = p2p_net.get_peers(self.idx)
         if not known_nodes:
             known_nodes = list(range(0, self.idx)) + list(range(self.idx + 1, self.p2p_net.size()))
@@ -770,8 +782,7 @@ class PENSNode(GossipNode):
 
         if self.step == 1:
             evaluation = CACHE[recv_model].evaluate(self.data[0])
-            # TODO: move performance metric as a parameter of the node
-            self.cache[sender] = (recv_model, -evaluation["accuracy"]) # keep the last model for the peer 'sender'
+            self.cache[sender] = (recv_model, -evaluation[self.performance_metric]) # keep the last model for the peer 'sender'
 
             if len(self.cache) >= self.n_sampled:
                 top_m = sorted(self.cache, key=lambda key: self.cache[key][1])[:self.m_top]

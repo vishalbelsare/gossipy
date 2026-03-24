@@ -191,7 +191,8 @@ class TorchModelHandler(ModelHandler):
                  local_epochs: int=1,
                  batch_size: int=32,
                  create_model_mode: CreateModelMode=CreateModelMode.MERGE_UPDATE,
-                 copy_model=True):
+                 copy_model=True,
+                 device: Optional[str]=None):
         """Handler for torch models.
 
         This handler is responsible for the training and evaluation of a pytorch model. Thus it
@@ -217,10 +218,18 @@ class TorchModelHandler(ModelHandler):
             The mode in which the model is created/updated
         copy_model : bool, default=True
             Whether to use a copy of the model (i.e., ``net``) or not.
+        device : str or None, default=None
+            The device to use for training and evaluation (e.g., ``"cpu"``, ``"cuda"``,
+            ``"cuda:0"``). If ``None``, defaults to ``"cuda"`` if available, otherwise ``"cpu"``.
         """
 
         super(TorchModelHandler, self).__init__(create_model_mode)
+        if device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(device)
         self.model = copy.deepcopy(net) if copy_model else net
+        self.model = self.model.to(self.device)
         self.optimizer = optimizer(self.model.parameters(), **optimizer_params)
         self.criterion = criterion
         assert (batch_size == 0 and local_epochs > 0) or (batch_size > 0)
@@ -235,6 +244,7 @@ class TorchModelHandler(ModelHandler):
     def _update(self, data: Tuple[torch.Tensor, torch.Tensor]) -> None:
         self.model = self.model.to(self.device)
         x, y = data
+        x, y = x.to(self.device), y.to(self.device)
         batch_size = x.size(0) if not self.batch_size else self.batch_size
         if self.local_epochs > 0:
             for _ in range(self.local_epochs):
@@ -245,7 +255,7 @@ class TorchModelHandler(ModelHandler):
         else:
             perm = torch.randperm(x.size(0))
             self._local_step(x[perm][:batch_size], y[perm][:batch_size])
-        self.model = self.model.to("cpu")
+        self.model.to("cpu")
     
     def _local_step(self, x:torch.Tensor, y:torch.Tensor) -> None:
         self.model.train()
@@ -293,10 +303,10 @@ class TorchModelHandler(ModelHandler):
         Dict[str, int]
             The evaluation results. The dictionary keys are the metrics names, and the values are
             the corresponding scores.
-        
+
         Notes
         -----
-        Currently, only metrics for classification tasks are implemented. Specifically, 
+        Currently, only metrics for classification tasks are implemented. Specifically,
         the evaluation metrics are: ``accuracy``, ``precision``, ``recall``, ``f1``, and,
         when possible, ``roc_auc``.
         """
@@ -304,8 +314,9 @@ class TorchModelHandler(ModelHandler):
         x, y = data
         x, y = x.to(self.device), y.to(self.device)
         self.model.eval()
-        self.model = self.model.to(self.device)
-        scores = self.model(x)
+        self.model.to(self.device)
+        with torch.no_grad():
+            scores = self.model(x)
 
         if y.dim() == 1:
             y_true = y.cpu().numpy().flatten()
@@ -325,7 +336,7 @@ class TorchModelHandler(ModelHandler):
         if scores.shape[1] == 2:
             auc_scores = scores[:, 1].detach().cpu().numpy().flatten()
             if len(set(y_true)) == 2:
-                res["auc"] = roc_auc_score(y_true, auc_scores).astype(float)
+                res["auc"] = float(roc_auc_score(y_true, auc_scores))
             else:
                 res["auc"] = 0.5
                 LOG.warning("# of classes != 2. AUC is set to 0.5.")
@@ -357,16 +368,16 @@ class AdaLineHandler(ModelHandler):
         super(AdaLineHandler, self).__init__(create_model_mode)
         self.model = copy.deepcopy(net) if copy_model else net
         self.learning_rate = learning_rate
-    
+
     def init(self) -> None:
         self.model.init_weights()
-    
+
     def _update(self, data: Tuple[torch.Tensor, torch.Tensor]) -> None:
         x, y = data
         self.n_updates += len(y)
         for i in range(len(y)):
             self.model.model += self.learning_rate * (y[i] - self.model(x[i:i+1])) * x[i]
-    
+
     def _merge(self, other_model_handler: PegasosHandler) -> None:
         self.model.model = Parameter(0.5 * (self.model.model + other_model_handler.model.model),
                                      requires_grad=False)
@@ -385,7 +396,7 @@ class AdaLineHandler(ModelHandler):
             "precision": precision_score(y_true, y_pred, zero_division=0, average="macro"),
             "recall": recall_score(y_true, y_pred, zero_division=0, average="macro"),
             "f1_score": f1_score(y_true, y_pred, zero_division=0, average="macro"),
-            "auc":  roc_auc_score(y_true, auc_scores).astype(float)
+            "auc": float(roc_auc_score(y_true, auc_scores))
         }
 
         return res
